@@ -464,6 +464,11 @@ def check_http(ip, port, use_tls=False):
     if port == 10000 and "webmin" in body.lower():
         out.append(finding("MEDIUM", "Webmin admin panel exposed", banner,
                            "Restrict access and keep Webmin updated (many past RCE CVEs)."))
+    tomcat_body = body
+    if "tomcat" not in (body + server).lower():
+        r404 = http_get(ip, port, "/netscan-" + os.urandom(4).hex(), use_tls)
+        tomcat_body = r404["body"] if r404 else ""
+    out += check_tomcat_http(ip, port, tomcat_body, server)
     if use_tls and "strict-transport-security" not in h:
         out.append(finding("INFO", "HTTPS without HSTS header", "", "Add Strict-Transport-Security if this is a web app."))
     return out, banner
@@ -585,6 +590,123 @@ def check_docker(ip, port):
     return [], ""
 
 
+# --- Apache Tomcat / AJP (Ghostcat, CVE-2020-1938) -------------------------
+# Detection only: sends an AJP "CPing" and an ordinary AJP GET for a page that
+# doesn't exist, then reads the Tomcat version from the 404 error page. It does
+# NOT send the javax.servlet.include.* attributes the Ghostcat exploit relies on.
+
+TOMCAT_RE = re.compile(r"Apache Tomcat/(\d+\.\d+\.\d+(?:\.M\d+)?)")
+GHOSTCAT_FIXED = {7: (7, 0, 100), 8: (8, 5, 51), 9: (9, 0, 31)}  # first fixed release per branch
+
+
+def _ajp_str(s):
+    if s is None:
+        return b"\xff\xff"
+    b = s.encode()
+    return struct.pack(">H", len(b)) + b + b"\x00"
+
+
+def ajp_cping(ip, port):
+    """True if the port speaks AJP13 (CPing -> CPong)."""
+    r = talk(ip, port, b"\x12\x34\x00\x01\x0a", timeout=3, limit=16)
+    return r[:5] == b"AB\x00\x01\x09"
+
+
+def ajp_get(ip, port, path):
+    """Plain AJP13 GET request. Returns (status, raw_response_bytes)."""
+    body = (b"\x02\x02" + _ajp_str("HTTP/1.1") + _ajp_str(path) + _ajp_str("127.0.0.1")
+            + _ajp_str(None) + _ajp_str(ip) + struct.pack(">H", 80) + b"\x00"
+            + struct.pack(">H", 2)
+            + b"\xa0\x0b" + _ajp_str(ip)                       # Host
+            + b"\xa0\x0e" + _ajp_str("netscan/" + VERSION)     # User-Agent
+            + b"\xff")
+    pkt = b"\x12\x34" + struct.pack(">H", len(body)) + body
+    raw = talk(ip, port, pkt, timeout=4, limit=65536)
+    status = None
+    i = raw.find(b"AB")
+    # first server packet: 'AB' len(2) prefix(1)=4 SEND_HEADERS status(2)
+    if i >= 0 and len(raw) >= i + 7 and raw[i + 4] == 4:
+        status = struct.unpack(">H", raw[i + 5:i + 7])[0]
+    return status, raw
+
+
+def tomcat_version_via_http(ip, http_ports):
+    """Tomcat's default 404 page prints its version; check the host's web ports."""
+    probe = "/netscan-" + os.urandom(4).hex()
+    for p in http_ports:
+        r = http_get(ip, p, probe, use_tls=p in TLS_PORTS)
+        if r:
+            m = TOMCAT_RE.search(r["body"] + " " + r["headers"].get("server", ""))
+            if m:
+                return m.group(1), f"{p}/tcp"
+    return None, None
+
+
+def ghostcat_verdict(ver):
+    """Return True (vulnerable), False (patched) for a Tomcat version string."""
+    v = vtuple(ver)
+    major = v[0]
+    if major <= 6:
+        return True                      # Tomcat 6 and older: never fixed
+    if major == 8 and v[1] == 0:
+        return True                      # 8.0.x: end-of-life, never fixed
+    if major in GHOSTCAT_FIXED:
+        return v < GHOSTCAT_FIXED[major]
+    return False                         # 10.x and newer shipped with the fix
+
+
+def check_ajp(ip, port, open_ports):
+    out = []
+    if not ajp_cping(ip, port):
+        return out, "", "unknown"
+    status, raw = ajp_get(ip, port, "/netscan-" + os.urandom(4).hex())
+    m = TOMCAT_RE.search(raw.decode("latin-1"))
+    ver, src = (m.group(1), "AJP 404 page") if m else (None, None)
+    if not ver:
+        web = [p for p in open_ports if p in HTTP_PORTS or p in TLS_PORTS]
+        ver, src = tomcat_version_via_http(ip, web)
+        if ver:
+            src = f"HTTP error page on {src}"
+    banner = f"AJP13 (Apache Tomcat {ver})" if ver else "AJP13"
+    fix = ("Update Tomcat to 9.0.31 / 8.5.51 / 7.0.100 or newer (on a NAS/appliance: update its firmware). "
+           "If nothing uses AJP, comment out the AJP <Connector port=\"8009\"> in conf/server.xml. "
+           "If you need it, set address=\"127.0.0.1\" and secretRequired=\"true\" with a long secret.")
+    if ver and ghostcat_verdict(ver):
+        out.append(finding("CRITICAL", f"Ghostcat (CVE-2020-1938): vulnerable Tomcat {ver} with AJP reachable",
+                           f"AJP port {port} answers without a secret and Tomcat {ver} (from {src}) is in the "
+                           "affected range. Anyone on the network can read web-app files such as config files "
+                           "with passwords; with file upload it can lead to code execution. CVSS 9.8.", fix))
+    elif status == 403:
+        out.append(finding("LOW", "AJP connector reachable but requires a secret",
+                           f"AJP port {port} rejected an unauthenticated request (403), which is how patched "
+                           f"Tomcat behaves with secretRequired=true.{' Version: ' + ver if ver else ''}",
+                           "Bind AJP to 127.0.0.1 if only a local web server uses it."))
+    elif ver:
+        out.append(finding("MEDIUM", f"AJP connector exposed (Tomcat {ver} is patched for Ghostcat)",
+                           f"Tomcat {ver} (from {src}) includes the CVE-2020-1938 fix, but AJP is still "
+                           "reachable from the network and accepted a request without a secret.",
+                           "Bind AJP to 127.0.0.1 or set secretRequired=\"true\" with a secret, or disable it."))
+    else:
+        out.append(finding("HIGH", "AJP connector exposed, Tomcat version unknown (possible Ghostcat)",
+                           f"AJP port {port} accepts unauthenticated requests but the Tomcat version is hidden, "
+                           "so CVE-2020-1938 can't be ruled out. Run with --nmap or check the version on the device.",
+                           fix))
+    return out, banner, "ajp"
+
+
+def check_tomcat_http(ip, port, r_body, server):
+    """Flag an old Tomcat seen on a web port (independent of AJP)."""
+    m = TOMCAT_RE.search(r_body + " " + server)
+    if not m:
+        return []
+    if vtuple(m.group(1))[0] <= 8:
+        return [finding("MEDIUM", f"End-of-life Apache Tomcat {m.group(1)}",
+                        "Tomcat 8.5 and older no longer receive security fixes.",
+                        "Upgrade to a supported Tomcat release (10.1.x or 11.x).")]
+    return [finding("INFO", f"Apache Tomcat {m.group(1)} detected", "Default error page reveals the version.",
+                    "Configure a custom error page / ErrorReportValve showServerInfo=\"false\".")]
+
+
 def check_mongodb(ip, port):
     return [finding("MEDIUM", "MongoDB port exposed", "Verify authentication is enabled.",
                     "Enable auth and bind to localhost if remote access isn't needed.")], "mongodb"
@@ -622,7 +744,6 @@ SIMPLE_EXPOSURE = {
     2049: ("MEDIUM", "NFS exposed", "Check exports are not world-readable."),
     873: ("MEDIUM", "rsync daemon exposed", "Check modules require authentication."),
     1723: ("MEDIUM", "PPTP VPN enabled", "PPTP encryption is broken; switch to WireGuard/IPsec/OpenVPN."),
-    8009: ("MEDIUM", "AJP connector exposed (Ghostcat CVE-2020-1938 risk)", "Disable AJP if unused, update Tomcat."),
     9100: ("LOW", "Raw printer port (JetDirect) open", "Anyone can send print jobs; restrict if possible."),
     111: ("LOW", "RPC portmapper exposed", "Disable if not needed."),
     23: None, 21: None,  # handled by dedicated checks
@@ -663,6 +784,8 @@ def assess_host(ip, open_ports):
                 fs, banner = check_docker(ip, port)
             elif port == 27017:
                 fs, banner = check_mongodb(ip, port)
+            elif port == 8009:
+                fs, banner, name = check_ajp(ip, port, open_ports)
             elif port in TLS_PORTS:
                 fs = check_tls(ip, port)
                 hf, banner = check_http(ip, port, use_tls=True)
